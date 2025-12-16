@@ -9,7 +9,7 @@ import os
 # CONFIGURATION GLOBALE
 # =========================================================
 SERVER = "mocha"
-UPDATE_INTERVAL = 5  # minutes
+UPDATE_INTERVAL = 1  # minutes
 NG_API_BASE = "https://publicapi.nationsglory.fr"
 
 NG_API_KEY = os.getenv("NG_API_KEY")
