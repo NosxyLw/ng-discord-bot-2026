@@ -8,6 +8,7 @@ import os
 # Configuration
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Variables globales
@@ -15,10 +16,12 @@ NG_API_KEY = os.getenv("NG_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 NG_API_BASE = "https://publicapi.nationsglory.fr"
 
-alert_channel_id = None
-underpower_cache = {}
+# Channels configurés
+list_channel_id = None  # Channel pour la liste (mise à jour toutes les 10 min)
+alert_channel_id = None  # Channel pour les alertes
+list_message_id = None  # ID du message de liste à éditer
 
-# Liste des serveurs NG
+underpower_cache = {}
 SERVERS = ["blue", "red", "green", "yellow"]
 
 
@@ -73,9 +76,73 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Erreur sync: {e}")
     
-    if not check_underpower.is_running():
-        check_underpower.start()
-        print("✅ Monitoring automatique démarré")
+    if not update_underpower_list.is_running():
+        update_underpower_list.start()
+        print("✅ Monitoring liste démarré (toutes les 10 min)")
+    
+    if not check_underpower_alerts.is_running():
+        check_underpower_alerts.start()
+        print("✅ Monitoring alertes démarré (toutes les 5 min)")
+
+
+@bot.tree.command(name="setup_list", description="Configure le channel pour la liste sous-power")
+@app_commands.describe(channel="Canal où afficher la liste")
+async def setup_list(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Configure le canal pour la liste mise à jour automatiquement"""
+    global list_channel_id, list_message_id
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Tu dois être administrateur!", ephemeral=True)
+        return
+    
+    list_channel_id = channel.id
+    list_message_id = None  # Reset le message
+    
+    embed = discord.Embed(
+        title="✅ Liste configurée",
+        description=f"La liste sera mise à jour dans {channel.mention} toutes les **10 minutes**.",
+        color=discord.Color.blue()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="setup_alerts", description="Configure le channel pour les alertes")
+@app_commands.describe(channel="Canal où envoyer les alertes")
+async def setup_alerts(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Configure le canal pour recevoir les alertes automatiques"""
+    global alert_channel_id
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Tu dois être administrateur!", ephemeral=True)
+        return
+    
+    alert_channel_id = channel.id
+    
+    embed = discord.Embed(
+        title="✅ Alertes configurées",
+        description=f"Les alertes seront envoyées dans {channel.mention} quand un pays passe en sous-power.",
+        color=discord.Color.blue()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="force_update", description="Force la mise à jour immédiate de la liste")
+async def force_update(interaction: discord.Interaction):
+    """Force une mise à jour immédiate de la liste"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Tu dois être administrateur!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    if not list_channel_id:
+        await interaction.followup.send("❌ Configure d'abord le channel avec `/setup_list`!")
+        return
+    
+    await update_underpower_list()
+    await interaction.followup.send("✅ Liste mise à jour!")
 
 
 @bot.tree.command(name="check_power", description="Vérifie le power d'un pays")
@@ -99,7 +166,6 @@ async def check_power(interaction: discord.Interaction, serveur: str, pays: str)
         await interaction.followup.send(f"❌ Pays `{pays}` introuvable sur le serveur **{serveur.upper()}**!")
         return
     
-    # Extraction des données
     name = country_data.get("name", pays)
     power = country_data.get("power", 0)
     claim = country_data.get("claim", 0)
@@ -109,7 +175,6 @@ async def check_power(interaction: discord.Interaction, serveur: str, pays: str)
     is_underpower = power < claim
     difference = power - claim
     
-    # Couleur selon le serveur
     server_colors = {
         "blue": discord.Color.blue(),
         "red": discord.Color.red(),
@@ -149,23 +214,23 @@ async def check_power(interaction: discord.Interaction, serveur: str, pays: str)
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="list_underpower", description="Liste tous les pays en sous-power")
-@app_commands.describe(serveur="Serveur NG (optionnel, tous par défaut)")
-@app_commands.choices(serveur=[
-    app_commands.Choice(name="Tous les serveurs", value="all"),
-    app_commands.Choice(name="Blue", value="blue"),
-    app_commands.Choice(name="Red", value="red"),
-    app_commands.Choice(name="Green", value="green"),
-    app_commands.Choice(name="Yellow", value="yellow")
-])
-async def list_underpower(interaction: discord.Interaction, serveur: str = "all"):
-    """Liste tous les pays actuellement en sous-power"""
-    await interaction.response.defer()
+@tasks.loop(minutes=10)
+async def update_underpower_list():
+    """Met à jour la liste des pays en sous-power toutes les 10 minutes"""
+    global list_channel_id, list_message_id
     
-    servers_to_check = SERVERS if serveur == "all" else [serveur]
+    if not list_channel_id:
+        return
+    
+    channel = bot.get_channel(list_channel_id)
+    if not channel:
+        return
+    
+    print(f"🔄 Mise à jour de la liste à {datetime.now().strftime('%H:%M:%S')}")
+    
     all_underpower = []
     
-    for server in servers_to_check:
+    for server in SERVERS:
         countries = ng_api.get_all_countries_on_server(server)
         
         for country in countries:
@@ -183,84 +248,73 @@ async def list_underpower(interaction: discord.Interaction, serveur: str = "all"
                     "deficit": deficit
                 })
     
-    if not all_underpower:
-        embed = discord.Embed(
-            title="✅ Aucun pays en sous-power",
-            description="Tous les pays ont suffisamment de power!",
-            color=discord.Color.green()
-        )
-        await interaction.followup.send(embed=embed)
-        return
-    
-    # Trier par déficit (du plus grave au moins grave)
+    # Trier par déficit
     all_underpower.sort(key=lambda x: x["deficit"], reverse=True)
     
-    # Créer la liste formatée
-    underpower_text = []
-    for country in all_underpower[:25]:  # Limite à 25 pour Discord
+    # Créer l'embed
+    embed = discord.Embed(
+        title="⚠️ Pays en Sous-Power",
+        description=f"**{len(all_underpower)} pays** actuellement en sous-power",
+        color=discord.Color.orange(),
+        timestamp=datetime.now()
+    )
+    
+    if not all_underpower:
+        embed.description = "✅ **Aucun pays en sous-power**"
+        embed.color = discord.Color.green()
+    else:
         server_emoji = {
             "blue": "🔵",
             "red": "🔴",
             "green": "🟢",
             "yellow": "🟡"
         }
-        emoji = server_emoji.get(country["server"], "⚪")
-        underpower_text.append(
-            f"{emoji} **{country['name']}** ({country['server'].upper()})\n"
-            f"   Power: `{country['power']:,}` / Claim: `{country['claim']:,}` | Déficit: `{country['deficit']:,}`"
-        )
+        
+        # Grouper par serveur
+        for server in SERVERS:
+            server_countries = [c for c in all_underpower if c["server"] == server]
+            
+            if server_countries:
+                emoji = server_emoji.get(server, "⚪")
+                text_list = []
+                
+                for country in server_countries[:10]:  # Max 10 par serveur
+                    text_list.append(
+                        f"**{country['name']}**: `{country['power']:,}` / `{country['claim']:,}` (Déficit: `{country['deficit']:,}`)"
+                    )
+                
+                field_text = "\n".join(text_list)
+                if len(server_countries) > 10:
+                    field_text += f"\n*+ {len(server_countries) - 10} autres...*"
+                
+                embed.add_field(
+                    name=f"{emoji} {server.upper()} ({len(server_countries)})",
+                    value=field_text,
+                    inline=False
+                )
     
-    embed = discord.Embed(
-        title=f"⚠️ Pays en sous-power ({len(all_underpower)})",
-        description="\n".join(underpower_text),
-        color=discord.Color.red(),
-        timestamp=datetime.now()
-    )
+    embed.set_footer(text="Prochaine mise à jour dans 10 minutes")
     
-    if len(all_underpower) > 25:
-        embed.set_footer(text=f"+ {len(all_underpower) - 25} autres pays...")
-    
-    await interaction.followup.send(embed=embed)
-
-
-@bot.tree.command(name="setup_alerts", description="Configure le canal pour les alertes")
-@app_commands.describe(channel="Canal où envoyer les alertes")
-async def setup_alerts(interaction: discord.Interaction, channel: discord.TextChannel):
-    """Configure le canal pour recevoir les alertes automatiques"""
-    global alert_channel_id
-    
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Tu dois être administrateur!", ephemeral=True)
-        return
-    
-    alert_channel_id = channel.id
-    
-    embed = discord.Embed(
-        title="✅ Alertes configurées",
-        description=f"Les alertes seront envoyées dans {channel.mention}\n"
-                   f"Vérification automatique toutes les 5 minutes.",
-        color=discord.Color.blue()
-    )
-    
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="stop_alerts", description="Désactive les alertes automatiques")
-async def stop_alerts(interaction: discord.Interaction):
-    """Désactive les alertes automatiques"""
-    global alert_channel_id
-    
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Tu dois être administrateur!", ephemeral=True)
-        return
-    
-    alert_channel_id = None
-    await interaction.response.send_message("✅ Alertes désactivées")
+    # Éditer ou créer le message
+    try:
+        if list_message_id:
+            try:
+                message = await channel.fetch_message(list_message_id)
+                await message.edit(embed=embed)
+            except discord.NotFound:
+                # Message supprimé, en créer un nouveau
+                message = await channel.send(embed=embed)
+                list_message_id = message.id
+        else:
+            message = await channel.send(embed=embed)
+            list_message_id = message.id
+    except Exception as e:
+        print(f"❌ Erreur mise à jour liste: {e}")
 
 
 @tasks.loop(minutes=5)
-async def check_underpower():
-    """Tâche automatique qui vérifie les pays en sous-power"""
+async def check_underpower_alerts():
+    """Vérifie les nouveaux pays en sous-power pour les alertes"""
     global alert_channel_id, underpower_cache
     
     if not alert_channel_id:
@@ -304,7 +358,7 @@ async def check_underpower():
         }
         
         embed = discord.Embed(
-            title="⚠️ ALERTE SOUS-POWER",
+            title="🚨 ALERTE SOUS-POWER",
             description=f"**{data['name']}** est passé en sous-power sur **{data['server'].upper()}**!",
             color=server_colors.get(data['server'], discord.Color.orange()),
             timestamp=datetime.now()
@@ -315,19 +369,24 @@ async def check_underpower():
         embed.add_field(name="📉 Déficit", value=f"`{data['deficit']:,}`", inline=True)
         
         await channel.send(embed=embed)
+        print(f"🚨 Alerte envoyée pour {data['name']} ({data['server']})")
     
     underpower_cache = current_underpower
 
 
-@check_underpower.before_loop
-async def before_check():
-    """Attend que le bot soit prêt avant de démarrer la boucle"""
+@update_underpower_list.before_loop
+async def before_update_list():
+    await bot.wait_until_ready()
+
+
+@check_underpower_alerts.before_loop
+async def before_check_alerts():
     await bot.wait_until_ready()
 
 
 if __name__ == "__main__":
     if not NG_API_KEY or not DISCORD_TOKEN:
         print("❌ Erreur: Variables d'environnement manquantes!")
-        print("Configure NG_API_KEY et DISCORD_TOKEN dans ton fichier .env")
+        print("Configure NG_API_KEY et DISCORD_TOKEN")
     else:
         bot.run(DISCORD_TOKEN)
