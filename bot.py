@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
 # Configuration
@@ -17,12 +17,15 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 NG_API_BASE = "https://publicapi.nationsglory.fr"
 
 # Channels configurés
-list_channel_id = None  # Channel pour la liste (mise à jour toutes les 10 min)
-alert_channel_id = None  # Channel pour les alertes
-list_message_id = None  # ID du message de liste à éditer
+list_channel_id = None
+alert_channel_id = None
+list_message_id = None
 
-underpower_cache = {}
-SERVERS = ["blue", "red", "green", "yellow"]
+# Cache pour les alertes (avec timestamp de dernière alerte)
+alert_cache = {}  # Format: {key: {"data": {...}, "last_alert": datetime}}
+ALERT_COOLDOWN = timedelta(hours=24)  # Re-alerter après 24h
+
+SERVERS = ["blue", "red", "green", "yellow", "mocha"]
 
 
 class NGApi:
@@ -39,7 +42,7 @@ class NGApi:
         """Récupère les infos d'un pays sur un serveur"""
         try:
             url = f"{NG_API_BASE}/country/{server}/{country_name}"
-            response = requests.get(url, headers=self.headers)
+            response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
                 return response.json()
@@ -52,7 +55,7 @@ class NGApi:
         """Récupère tous les pays d'un serveur"""
         try:
             url = f"{NG_API_BASE}/countries/{server}"
-            response = requests.get(url, headers=self.headers)
+            response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
                 return response.json()
@@ -96,7 +99,7 @@ async def setup_list(interaction: discord.Interaction, channel: discord.TextChan
         return
     
     list_channel_id = channel.id
-    list_message_id = None  # Reset le message
+    list_message_id = None
     
     embed = discord.Embed(
         title="✅ Liste configurée",
@@ -105,6 +108,9 @@ async def setup_list(interaction: discord.Interaction, channel: discord.TextChan
     )
     
     await interaction.response.send_message(embed=embed)
+    
+    # Lancer une première mise à jour immédiate
+    await update_underpower_list()
 
 
 @bot.tree.command(name="setup_alerts", description="Configure le channel pour les alertes")
@@ -121,7 +127,7 @@ async def setup_alerts(interaction: discord.Interaction, channel: discord.TextCh
     
     embed = discord.Embed(
         title="✅ Alertes configurées",
-        description=f"Les alertes seront envoyées dans {channel.mention} quand un pays passe en sous-power.",
+        description=f"Les alertes seront envoyées dans {channel.mention}\nRe-alerte après 24h si toujours en sous-power.",
         color=discord.Color.blue()
     )
     
@@ -147,20 +153,21 @@ async def force_update(interaction: discord.Interaction):
 
 @bot.tree.command(name="check_power", description="Vérifie le power d'un pays")
 @app_commands.describe(
-    serveur="Serveur NG (blue/red/green/yellow)",
+    serveur="Serveur NG",
     pays="Nom du pays à vérifier"
 )
 @app_commands.choices(serveur=[
     app_commands.Choice(name="Blue", value="blue"),
     app_commands.Choice(name="Red", value="red"),
     app_commands.Choice(name="Green", value="green"),
-    app_commands.Choice(name="Yellow", value="yellow")
+    app_commands.Choice(name="Yellow", value="yellow"),
+    app_commands.Choice(name="Mocha", value="mocha")
 ])
 async def check_power(interaction: discord.Interaction, serveur: str, pays: str):
     """Commande pour vérifier le power d'un pays spécifique"""
     await interaction.response.defer()
     
-    country_data = ng_api.get_country_info(serveur, pays.lower())
+    country_data = ng_api.get_country_info(serveur, pays)
     
     if not country_data or "error" in country_data:
         await interaction.followup.send(f"❌ Pays `{pays}` introuvable sur le serveur **{serveur.upper()}**!")
@@ -168,18 +175,19 @@ async def check_power(interaction: discord.Interaction, serveur: str, pays: str)
     
     name = country_data.get("name", pays)
     power = country_data.get("power", 0)
-    claim = country_data.get("claim", 0)
-    capital = country_data.get("capital", "N/A")
+    claims = country_data.get("count_claims", 0)
     leader = country_data.get("leader", "N/A")
+    members = country_data.get("count_members", 0)
     
-    is_underpower = power < claim
-    difference = power - claim
+    is_underpower = power < claims
+    difference = power - claims
     
     server_colors = {
         "blue": discord.Color.blue(),
         "red": discord.Color.red(),
         "green": discord.Color.green(),
-        "yellow": discord.Color.gold()
+        "yellow": discord.Color.gold(),
+        "mocha": discord.Color.from_rgb(139, 69, 19)
     }
     
     embed_color = discord.Color.red() if is_underpower else server_colors.get(serveur, discord.Color.blue())
@@ -192,11 +200,12 @@ async def check_power(interaction: discord.Interaction, serveur: str, pays: str)
     )
     
     embed.add_field(name="⚡ Power", value=f"`{power:,}`", inline=True)
-    embed.add_field(name="🗺️ Claim", value=f"`{claim:,}`", inline=True)
+    embed.add_field(name="🗺️ Claims", value=f"`{claims:,}`", inline=True)
     embed.add_field(name="📈 Différence", value=f"`{difference:,}`", inline=True)
     
-    embed.add_field(name="🏛️ Capitale", value=f"`{capital}`", inline=True)
     embed.add_field(name="👑 Leader", value=f"`{leader}`", inline=True)
+    embed.add_field(name="👥 Membres", value=f"`{members}`", inline=True)
+    embed.add_field(name="⚡", value="\u200b", inline=True)
     
     if is_underpower:
         embed.add_field(
@@ -236,22 +245,20 @@ async def update_underpower_list():
         for country in countries:
             name = country.get("name", "Inconnu")
             power = country.get("power", 0)
-            claim = country.get("claim", 0)
+            claims = country.get("count_claims", 0)
             
-            if power < claim:
-                deficit = claim - power
+            if power < claims:
+                deficit = claims - power
                 all_underpower.append({
                     "server": server,
                     "name": name,
                     "power": power,
-                    "claim": claim,
+                    "claims": claims,
                     "deficit": deficit
                 })
     
-    # Trier par déficit
     all_underpower.sort(key=lambda x: x["deficit"], reverse=True)
     
-    # Créer l'embed
     embed = discord.Embed(
         title="⚠️ Pays en Sous-Power",
         description=f"**{len(all_underpower)} pays** actuellement en sous-power",
@@ -267,10 +274,10 @@ async def update_underpower_list():
             "blue": "🔵",
             "red": "🔴",
             "green": "🟢",
-            "yellow": "🟡"
+            "yellow": "🟡",
+            "mocha": "🟤"
         }
         
-        # Grouper par serveur
         for server in SERVERS:
             server_countries = [c for c in all_underpower if c["server"] == server]
             
@@ -278,9 +285,9 @@ async def update_underpower_list():
                 emoji = server_emoji.get(server, "⚪")
                 text_list = []
                 
-                for country in server_countries[:10]:  # Max 10 par serveur
+                for country in server_countries[:10]:
                     text_list.append(
-                        f"**{country['name']}**: `{country['power']:,}` / `{country['claim']:,}` (Déficit: `{country['deficit']:,}`)"
+                        f"**{country['name']}**: `{country['power']:,}` / `{country['claims']:,}` (Déficit: `{country['deficit']:,}`)"
                     )
                 
                 field_text = "\n".join(text_list)
@@ -295,27 +302,26 @@ async def update_underpower_list():
     
     embed.set_footer(text="Prochaine mise à jour dans 10 minutes")
     
-    # Éditer ou créer le message
     try:
         if list_message_id:
             try:
                 message = await channel.fetch_message(list_message_id)
                 await message.edit(embed=embed)
             except discord.NotFound:
-                # Message supprimé, en créer un nouveau
                 message = await channel.send(embed=embed)
                 list_message_id = message.id
         else:
             message = await channel.send(embed=embed)
             list_message_id = message.id
+        print(f"✅ Liste mise à jour ({len(all_underpower)} pays en sous-power)")
     except Exception as e:
         print(f"❌ Erreur mise à jour liste: {e}")
 
 
 @tasks.loop(minutes=5)
 async def check_underpower_alerts():
-    """Vérifie les nouveaux pays en sous-power pour les alertes"""
-    global alert_channel_id, underpower_cache
+    """Vérifie les pays en sous-power pour les alertes (re-alerte après 24h)"""
+    global alert_channel_id, alert_cache
     
     if not alert_channel_id:
         return
@@ -324,6 +330,7 @@ async def check_underpower_alerts():
     if not channel:
         return
     
+    now = datetime.now()
     current_underpower = {}
     
     for server in SERVERS:
@@ -332,46 +339,67 @@ async def check_underpower_alerts():
         for country in countries:
             name = country.get("name")
             power = country.get("power", 0)
-            claim = country.get("claim", 0)
+            claims = country.get("count_claims", 0)
             
-            if power < claim:
+            if power < claims:
                 key = f"{server}_{name}"
                 current_underpower[key] = {
                     "server": server,
                     "name": name,
                     "power": power,
-                    "claim": claim,
-                    "deficit": claim - power
+                    "claims": claims,
+                    "deficit": claims - power
                 }
     
-    # Nouveaux pays en sous-power
-    new_underpower = set(current_underpower.keys()) - set(underpower_cache.keys())
+    # Vérifier quels pays doivent être alertés
+    for key, data in current_underpower.items():
+        should_alert = False
+        
+        if key not in alert_cache:
+            # Nouveau pays en sous-power
+            should_alert = True
+        else:
+            # Pays déjà en sous-power, vérifier si 24h écoulées
+            last_alert = alert_cache[key]["last_alert"]
+            if now - last_alert >= ALERT_COOLDOWN:
+                should_alert = True
+        
+        if should_alert:
+            server_colors = {
+                "blue": discord.Color.blue(),
+                "red": discord.Color.red(),
+                "green": discord.Color.green(),
+                "yellow": discord.Color.gold(),
+                "mocha": discord.Color.from_rgb(139, 69, 19)
+            }
+            
+            is_new = key not in alert_cache
+            title = "🚨 NOUVEAU SOUS-POWER" if is_new else "⚠️ TOUJOURS EN SOUS-POWER"
+            
+            embed = discord.Embed(
+                title=title,
+                description=f"**{data['name']}** {'est passé' if is_new else 'est toujours'} en sous-power sur **{data['server'].upper()}**!",
+                color=server_colors.get(data['server'], discord.Color.orange()),
+                timestamp=now
+            )
+            
+            embed.add_field(name="⚡ Power", value=f"`{data['power']:,}`", inline=True)
+            embed.add_field(name="🗺️ Claims", value=f"`{data['claims']:,}`", inline=True)
+            embed.add_field(name="📉 Déficit", value=f"`{data['deficit']:,}`", inline=True)
+            
+            await channel.send(embed=embed)
+            print(f"🚨 Alerte envoyée pour {data['name']} ({data['server']})")
+            
+            # Mettre à jour le cache avec le timestamp actuel
+            alert_cache[key] = {
+                "data": data,
+                "last_alert": now
+            }
     
-    for key in new_underpower:
-        data = current_underpower[key]
-        
-        server_colors = {
-            "blue": discord.Color.blue(),
-            "red": discord.Color.red(),
-            "green": discord.Color.green(),
-            "yellow": discord.Color.gold()
-        }
-        
-        embed = discord.Embed(
-            title="🚨 ALERTE SOUS-POWER",
-            description=f"**{data['name']}** est passé en sous-power sur **{data['server'].upper()}**!",
-            color=server_colors.get(data['server'], discord.Color.orange()),
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(name="⚡ Power", value=f"`{data['power']:,}`", inline=True)
-        embed.add_field(name="🗺️ Claim", value=f"`{data['claim']:,}`", inline=True)
-        embed.add_field(name="📉 Déficit", value=f"`{data['deficit']:,}`", inline=True)
-        
-        await channel.send(embed=embed)
-        print(f"🚨 Alerte envoyée pour {data['name']} ({data['server']})")
-    
-    underpower_cache = current_underpower
+    # Nettoyer le cache des pays qui ne sont plus en sous-power
+    keys_to_remove = [k for k in alert_cache.keys() if k not in current_underpower]
+    for key in keys_to_remove:
+        del alert_cache[key]
 
 
 @update_underpower_list.before_loop
